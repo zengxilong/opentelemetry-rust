@@ -63,6 +63,12 @@ pub enum MetricsError {
     /// for full list of requirements.
     #[error("Invalid instrument configuration: {0}")]
     InvalidInstrumentConfiguration(&'static str),
+    /// Errors when conflicting metric types.
+    #[error("conflicting metric types, metric name: {0} ")]
+    ConflictingMetricType(String),
+    /// Errors when conflicting metric help.
+    #[error("conflicting metric help, metric {0} help is {1}, but got {2}")]
+    ConflictingMetricHelp(String, String, String),
 }
 
 impl<T: ExportError> From<T> for MetricsError {
