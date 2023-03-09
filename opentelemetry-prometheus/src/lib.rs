@@ -104,7 +104,6 @@ use opentelemetry::{global, InstrumentationLibrary, StringValue};
 pub use prometheus::{Encoder, TextEncoder};
 use std::collections::btree_map::Entry as BEntry;
 use std::collections::BTreeMap;
-use std::net::IpAddr::V4;
 use std::sync::{Arc, Mutex};
 
 mod sanitize;
@@ -259,7 +258,7 @@ impl PrometheusExporter {
 struct Collector {
     controller: Arc<Mutex<BasicController>>,
     with_scope_info: bool,
-    collected_mfs: BTreeMap<String, prometheus::proto::MetricFamily>,
+    collected_mfs: Arc<Mutex<BTreeMap<String, prometheus::proto::MetricFamily>>>,
 }
 
 impl TemporalitySelector for Collector {
@@ -273,7 +272,7 @@ impl Collector {
         Collector {
             controller,
             with_scope_info: true,
-            collected_mfs: BTreeMap::new(),
+            collected_mfs: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
     fn with_scope_info(mut self, with_scope_info: bool) -> Self {
@@ -302,7 +301,11 @@ impl prometheus::core::Collector for Collector {
                 let mut scope_labels: Vec<prometheus::proto::LabelPair> = Vec::new();
                 if self.with_scope_info {
                     scope_labels = get_scope_labels(library);
-                    metrics.push(build_scope_metric(scope_labels.clone()));
+                    if let Some(scope_metric) =
+                        build_scope_metric(scope_labels.clone(), self.collected_mfs.clone())
+                    {
+                        metrics.push(scope_metric);
+                    }
                 }
                 reader.try_for_each(self, &mut |record| {
                     let agg = record.aggregator().ok_or(MetricsError::NoDataCollected)?;
@@ -313,24 +316,21 @@ impl prometheus::core::Collector for Collector {
                     let labels =
                         get_metric_labels(record, controller.resource(), &mut scope_labels.clone());
 
+                    let mut metric: Option<prometheus::proto::MetricFamily> = None;
+                    let mfs = self.collected_mfs.clone();
                     if let Some(hist) = agg.as_any().downcast_ref::<HistogramAggregator>() {
-                        metrics.push(build_histogram(hist, number_kind, desc, labels)?);
+                        metric = build_histogram(hist, number_kind, desc, labels, mfs)?;
                     } else if let Some(sum) = agg.as_any().downcast_ref::<SumAggregator>() {
-                        let counter = if instrument_kind.monotonic() {
-                            build_monotonic_counter(
-                                sum,
-                                number_kind,
-                                desc,
-                                labels,
-                                &mut self.collected_mfs,
-                            )?
+                        metric = if instrument_kind.monotonic() {
+                            build_monotonic_counter(sum, number_kind, desc, labels, mfs)?
                         } else {
-                            build_non_monotonic_counter(sum, number_kind, desc, labels)?
+                            build_non_monotonic_counter(sum, number_kind, desc, labels, mfs)?
                         };
-
-                        metrics.push();
                     } else if let Some(last) = agg.as_any().downcast_ref::<LastValueAggregator>() {
-                        metrics.push(build_last_value(last, number_kind, desc, labels)?);
+                        metric = build_last_value(last, number_kind, desc, labels, mfs)?;
+                    }
+                    if let Some(m) = metric {
+                        metrics.push(m);
                     }
 
                     Ok(())
@@ -351,7 +351,14 @@ fn build_last_value(
     kind: &NumberKind,
     desc: PrometheusMetricDesc,
     labels: Vec<prometheus::proto::LabelPair>,
-) -> Result<prometheus::proto::MetricFamily, MetricsError> {
+    collected_mfs: Arc<Mutex<BTreeMap<String, prometheus::proto::MetricFamily>>>,
+) -> Result<Option<prometheus::proto::MetricFamily>, MetricsError> {
+    let metric_type = prometheus::proto::MetricType::GAUGE;
+    let (collisional, desc) = validate_collisional_metric(desc, metric_type, collected_mfs);
+    if collisional {
+        return Ok(None);
+    }
+
     let (last_value, _) = lv.last_value()?;
 
     let mut g = prometheus::proto::Gauge::default();
@@ -364,10 +371,10 @@ fn build_last_value(
     let mut mf = prometheus::proto::MetricFamily::default();
     mf.set_name(desc.name);
     mf.set_help(desc.help);
-    mf.set_field_type(prometheus::proto::MetricType::GAUGE);
+    mf.set_field_type(metric_type);
     mf.set_metric(protobuf::RepeatedField::from_vec(vec![m]));
 
-    Ok(mf)
+    Ok(Some(mf))
 }
 
 fn build_non_monotonic_counter(
@@ -375,7 +382,14 @@ fn build_non_monotonic_counter(
     kind: &NumberKind,
     desc: PrometheusMetricDesc,
     labels: Vec<prometheus::proto::LabelPair>,
-) -> Result<prometheus::proto::MetricFamily, MetricsError> {
+    collected_mfs: Arc<Mutex<BTreeMap<String, prometheus::proto::MetricFamily>>>,
+) -> Result<Option<prometheus::proto::MetricFamily>, MetricsError> {
+    let metric_type = prometheus::proto::MetricType::GAUGE;
+    let (collisional, desc) = validate_collisional_metric(desc, metric_type, collected_mfs);
+    if collisional {
+        return Ok(None);
+    }
+
     let sum = sum.sum()?;
 
     let mut g = prometheus::proto::Gauge::default();
@@ -388,10 +402,10 @@ fn build_non_monotonic_counter(
     let mut mf = prometheus::proto::MetricFamily::default();
     mf.set_name(desc.name);
     mf.set_help(desc.help);
-    mf.set_field_type(prometheus::proto::MetricType::GAUGE);
+    mf.set_field_type(metric_type);
     mf.set_metric(protobuf::RepeatedField::from_vec(vec![m]));
 
-    Ok(mf)
+    Ok(Some(mf))
 }
 
 fn build_monotonic_counter(
@@ -399,12 +413,12 @@ fn build_monotonic_counter(
     kind: &NumberKind,
     desc: PrometheusMetricDesc,
     labels: Vec<prometheus::proto::LabelPair>,
-    collected_mfs: &mut BTreeMap<String, prometheus::proto::MetricFamily>,
-) -> Result<prometheus::proto::MetricFamily, MetricsError> {
+    collected_mfs: Arc<Mutex<BTreeMap<String, prometheus::proto::MetricFamily>>>,
+) -> Result<Option<prometheus::proto::MetricFamily>, MetricsError> {
     let metric_type = prometheus::proto::MetricType::COUNTER;
-    let (collisional, desc) = validate_collisional_metric(desc, &metric_type, collected_mfs);
+    let (collisional, desc) = validate_collisional_metric(desc, metric_type, collected_mfs);
     if collisional {
-        return Ok(());
+        return Ok(None);
     }
     let sum = sum.sum()?;
 
@@ -421,7 +435,7 @@ fn build_monotonic_counter(
     mf.set_field_type(metric_type);
     mf.set_metric(protobuf::RepeatedField::from_vec(vec![m]));
 
-    Ok(mf)
+    Ok(Some(mf))
 }
 
 fn build_histogram(
@@ -429,7 +443,14 @@ fn build_histogram(
     kind: &NumberKind,
     desc: PrometheusMetricDesc,
     labels: Vec<prometheus::proto::LabelPair>,
-) -> Result<prometheus::proto::MetricFamily, MetricsError> {
+    collected_mfs: Arc<Mutex<BTreeMap<String, prometheus::proto::MetricFamily>>>,
+) -> Result<Option<prometheus::proto::MetricFamily>, MetricsError> {
+    let metric_type = prometheus::proto::MetricType::HISTOGRAM;
+    let (collisional, desc) = validate_collisional_metric(desc, metric_type, collected_mfs);
+    if collisional {
+        return Ok(None);
+    }
+
     let raw_buckets = hist.histogram()?;
     let sum = hist.sum()?;
 
@@ -457,15 +478,25 @@ fn build_histogram(
     let mut mf = prometheus::proto::MetricFamily::default();
     mf.set_name(desc.name);
     mf.set_help(desc.help);
-    mf.set_field_type(prometheus::proto::MetricType::HISTOGRAM);
+    mf.set_field_type(metric_type);
     mf.set_metric(protobuf::RepeatedField::from_vec(vec![m]));
 
-    Ok(mf)
+    Ok(Some(mf))
 }
 
 fn build_scope_metric(
     labels: Vec<prometheus::proto::LabelPair>,
-) -> prometheus::proto::MetricFamily {
+    collected_mfs: Arc<Mutex<BTreeMap<String, prometheus::proto::MetricFamily>>>,
+) -> Option<prometheus::proto::MetricFamily> {
+    let desc = PrometheusMetricDesc {
+        name: String::from(SCOPE_INFO_METRIC_NAME),
+        help: String::from(SCOPE_INFO_DESCRIPTION),
+    };
+    let metric_type = prometheus::proto::MetricType::GAUGE;
+    let (collisional, desc) = validate_collisional_metric(desc, metric_type, collected_mfs);
+    if collisional {
+        return None;
+    }
     let mut g = prometheus::proto::Gauge::new();
     g.set_value(1.0);
 
@@ -474,12 +505,12 @@ fn build_scope_metric(
     m.set_gauge(g);
 
     let mut mf = prometheus::proto::MetricFamily::default();
-    mf.set_name(String::from(SCOPE_INFO_METRIC_NAME));
-    mf.set_help(String::from(SCOPE_INFO_DESCRIPTION));
-    mf.set_field_type(prometheus::proto::MetricType::GAUGE);
+    mf.set_name(desc.name);
+    mf.set_help(desc.help);
+    mf.set_field_type(metric_type);
     mf.set_metric(protobuf::RepeatedField::from_vec(vec![m]));
 
-    mf
+    Some(mf)
 }
 
 fn get_scope_labels(library: &InstrumentationLibrary) -> Vec<prometheus::proto::LabelPair> {
@@ -543,38 +574,40 @@ fn get_metric_desc(record: &Record<'_>) -> PrometheusMetricDesc {
 
 fn validate_collisional_metric(
     desc: PrometheusMetricDesc,
-    metric_type: &prometheus::proto::MetricType,
-    collected_mfs: &mut BTreeMap<String, prometheus::proto::MetricFamily>,
+    metric_type: prometheus::proto::MetricType,
+    collected_mfs: Arc<Mutex<BTreeMap<String, prometheus::proto::MetricFamily>>>,
 ) -> (bool, PrometheusMetricDesc) {
-    match collected_mfs.entry(desc.name.to_owned()) {
-        BEntry::Vacant(entry) => {
-            let mut mf = prometheus::proto::MetricFamily::default();
-            mf.set_name(desc.name.to_owned());
-            mf.set_help(desc.help.to_owned());
-            mf.set_field_type(metric_type.to_owned());
-            entry.insert(mf);
-            return (false, desc);
-        }
-        BEntry::Occupied(mut entry) => {
-            let existent_mf = entry.get_mut();
-            if metric_type == existent_mf.get_field_type() {
-                global::handle_error(MetricsError::ConflictingMetricType(desc.name.to_owned()));
-                return (true, desc);
+    if let Ok(mut mfs) = collected_mfs.lock() {
+        match mfs.entry(desc.name.to_owned()) {
+            BEntry::Vacant(entry) => {
+                let mut mf = prometheus::proto::MetricFamily::default();
+                mf.set_name(desc.name.to_owned());
+                mf.set_help(desc.help.to_owned());
+                mf.set_field_type(metric_type.to_owned());
+                entry.insert(mf);
+                return (false, desc);
             }
-            let existent_metric_help = existent_mf.get_help();
-            if desc.help.as_str() == existent_metric_help {
-                global::handle_error(MetricsError::ConflictingMetricHelp(
-                    desc.name.to_owned(),
-                    String::from(existent_metric_help),
-                    desc.help.to_owned(),
-                ));
-                return (
-                    false,
-                    PrometheusMetricDesc {
-                        name: desc.name.to_owned(),
-                        help: String::from(existent_metric_help),
-                    },
-                );
+            BEntry::Occupied(mut entry) => {
+                let existent_mf = entry.get_mut();
+                if metric_type != existent_mf.get_field_type() {
+                    global::handle_error(MetricsError::ConflictingMetricType(desc.name.to_owned()));
+                    return (true, desc);
+                }
+                let existent_metric_help = existent_mf.get_help();
+                if desc.help.as_str() != existent_metric_help {
+                    global::handle_error(MetricsError::ConflictingMetricHelp(
+                        desc.name.to_owned(),
+                        String::from(existent_metric_help),
+                        desc.help.to_owned(),
+                    ));
+                    return (
+                        false,
+                        PrometheusMetricDesc {
+                            name: desc.name.to_owned(),
+                            help: String::from(existent_metric_help),
+                        },
+                    );
+                }
             }
         }
     }
